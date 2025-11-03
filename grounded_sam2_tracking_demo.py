@@ -104,6 +104,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional path for the output video. If not set, a name is derived from the source.",
     )
     parser.add_argument(
+        "--frame-rate",
+        type=float,
+        default=25.0,
+        help="Frame rate (frames per second) for the output video.",
+    )
+    parser.add_argument(
         "--sam2-variant",
         default=SAM2_MODEL_VARIANT,
         choices=list(SAM2_VARIANTS.keys()),
@@ -320,7 +326,7 @@ def main(args: argparse.Namespace) -> None:
             video_stem = "tracking_output"
         output_video_path = os.path.join(".", f"grounded_sam2_tracking_{video_stem}.mp4")
 
-    create_video_from_images(save_dir, output_video_path)
+    create_video_from_images(save_dir, output_video_path, frame_rate=args.frame_rate)
 
 
 if __name__ == "__main__":
