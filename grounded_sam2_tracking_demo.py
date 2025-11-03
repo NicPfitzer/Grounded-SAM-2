@@ -162,7 +162,9 @@ class VideoFrames:
             if bgr is None:
                 raise RuntimeError(f"Failed to read frame from {frame_path}")
             return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        return self._reader[index].asnumpy()
+        tensor = self._reader[index]
+        rgb_frame = tensor.numpy()
+        return rgb_frame
 
     def get_bgr(self, index: int) -> np.ndarray:
         if self.kind == "folder":
@@ -171,7 +173,9 @@ class VideoFrames:
             if bgr is None:
                 raise RuntimeError(f"Failed to read frame from {frame_path}")
             return bgr
-        return cv2.cvtColor(self._reader[index].asnumpy(), cv2.COLOR_RGB2BGR)
+        tensor = self._reader[index]
+        rgb_frame = tensor.numpy()
+        return cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
 
     def get_frame_label(self, index: int) -> str:
         return self.frame_ids[index]
