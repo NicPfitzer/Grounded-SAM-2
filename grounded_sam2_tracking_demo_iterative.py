@@ -112,6 +112,11 @@ def parse_args() -> argparse.Namespace:
         help="Grounding DINO checkpoint to use ('large' = rziga/mm_grounding_dino_large_all, 'tiny' = IDEA-Research/grounding-dino-tiny).",
     )
     parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Run Grounding DINO and SAM 2 in half precision (FP16) when supported.",
+    )
+    parser.add_argument(
         "--max-dino-long-edge",
         type=int,
         default=1024,
@@ -361,6 +366,8 @@ def main(args: argparse.Namespace) -> None:
 
     video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
     sam2_image_model = build_sam2(model_cfg, sam2_checkpoint, device=device)
+    if args.fp16 and device in {"cuda", "mps"}:
+        sam2_image_model = sam2_image_model.half()
     image_predictor = SAM2ImagePredictor(sam2_image_model)
 
     dino_id = {
@@ -368,7 +375,10 @@ def main(args: argparse.Namespace) -> None:
         "tiny": "IDEA-Research/grounding-dino-tiny",
     }[args.dino_model]
     processor = AutoProcessor.from_pretrained(dino_id)
-    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(dino_id).to(device)
+    dino_kwargs = {"torch_dtype": torch.float16} if args.fp16 and device in {"cuda", "mps"} else {}
+    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(
+        dino_id, **dino_kwargs
+    ).to(device)
 
     inference_state = video_predictor.init_state(
         video_path=video_frames.source,
