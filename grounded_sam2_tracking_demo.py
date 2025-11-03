@@ -274,6 +274,13 @@ def main(args: argparse.Namespace) -> None:
     input_boxes = results[0]["boxes"].cpu().numpy()
     OBJECTS = results[0]["labels"]
 
+    if input_boxes.size == 0:
+        print(
+            "[Grounded SAM 2 Tracking] No detections returned by Grounding DINO. "
+            "Adjust the text/thresholds or provide an initial bounding box before running tracking."
+        )
+        return
+
     masks, scores, logits = image_predictor.predict(
         point_coords=None,
         point_labels=None,
