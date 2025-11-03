@@ -506,6 +506,7 @@ def main(args: argparse.Namespace) -> None:
         skipped_frames: List[int] = []
 
         for entry in mask_index:
+            print("[Grounded SAM 2 Tracking] Annotating frame:", entry, "out of", len(mask_index))
             frame_idx, object_ids, masks = load_frame_masks(entry)
             img = video_frames.get_bgr(frame_idx)
 
