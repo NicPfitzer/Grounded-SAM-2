@@ -531,7 +531,7 @@ def main(args: argparse.Namespace) -> None:
             )
             mask_annotator = sv.MaskAnnotator()
             annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
-
+            print(f"[Grounded SAM 2 Tracking][Debug] Saving annotated frame {frame_idx:05d} with {len(object_ids)} tracked objects.")
             output_path = os.path.join(save_dir, f"annotated_frame_{frame_idx:05d}.jpg")
             if cv2.imwrite(output_path, annotated_frame):
                 written_frames.append(frame_idx)
