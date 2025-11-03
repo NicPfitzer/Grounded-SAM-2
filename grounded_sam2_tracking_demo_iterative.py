@@ -404,11 +404,20 @@ def main(args: argparse.Namespace) -> None:
             image = Image.fromarray(frame_rgb)
             image_for_dino = resize_longest_edge(image, args.max_dino_long_edge)
 
-            inputs = processor(
+            raw_inputs = processor(
                 images=image_for_dino,
                 text=args.text,
                 return_tensors="pt",
-            ).to(device)
+            )
+            inputs = {}
+            for key, value in raw_inputs.items():
+                if isinstance(value, torch.Tensor):
+                    if args.fp16 and device in {"cuda", "mps"} and value.is_floating_point():
+                        inputs[key] = value.to(device=device, dtype=torch.float16)
+                    else:
+                        inputs[key] = value.to(device)
+                else:
+                    inputs[key] = value
             with torch.no_grad():
                 outputs = grounding_model(**inputs)
 
