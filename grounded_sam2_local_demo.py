@@ -14,18 +14,69 @@ from grounding_dino.groundingdino.util.inference import load_model, load_image, 
 """
 Hyper parameters
 """
-TEXT_PROMPT = "car. tire."
-IMG_PATH = "notebooks/images/truck.jpg"
+TEXT_PROMPT = "trees. electricity pole. wire. person. snow."
+IMG_PATH = "notebooks/images/snowy_line.png"
 SAM2_CHECKPOINT = "./checkpoints/sam2.1_hiera_large.pt"
 SAM2_MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
-GROUNDING_DINO_CONFIG = "grounding_dino/groundingdino/config/GroundingDINO_SwinT_OGC.py"
-GROUNDING_DINO_CHECKPOINT = "gdino_checkpoints/groundingdino_swint_ogc.pth"
+GROUNDING_DINO_CONFIG = "grounding_dino/groundingdino/config/GroundingDINO_SwinB_cfg.py"
+GROUNDING_DINO_CHECKPOINT = "gdino_checkpoints/groundingdino_swinb_cogcoor.pth"
 BOX_THRESHOLD = 0.35
 TEXT_THRESHOLD = 0.25
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 OUTPUT_DIR = Path("outputs/grounded_sam2_local_demo")
 DUMP_JSON_RESULTS = True
-MULTIMASK_OUTPUT = False
+MULTIMASK_OUTPUT = True
+BOX_SHRINK_RATIO = 1.0
+MORPH_KERNEL_SIZE = 3
+
+
+def shrink_boxes_xyxy(boxes: np.ndarray, ratio: float, img_width: int, img_height: int) -> np.ndarray:
+    if boxes.size == 0 or not (0 < ratio < 1):
+        return boxes
+    shrunk = boxes.copy()
+    widths = shrunk[:, 2] - shrunk[:, 0]
+    heights = shrunk[:, 3] - shrunk[:, 1]
+    centers_x = shrunk[:, 0] + widths * 0.5
+    centers_y = shrunk[:, 1] + heights * 0.5
+    half_widths = widths * ratio * 0.5
+    half_heights = heights * ratio * 0.5
+    shrunk[:, 0] = centers_x - half_widths
+    shrunk[:, 2] = centers_x + half_widths
+    shrunk[:, 1] = centers_y - half_heights
+    shrunk[:, 3] = centers_y + half_heights
+    shrunk[:, [0, 2]] = np.clip(shrunk[:, [0, 2]], 0, img_width)
+    shrunk[:, [1, 3]] = np.clip(shrunk[:, [1, 3]], 0, img_height)
+    return shrunk
+
+
+def apply_morphological_opening(masks: np.ndarray, kernel_size: int) -> np.ndarray:
+    if masks.size == 0 or kernel_size <= 1:
+        return masks
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    processed_masks = []
+    for mask in masks:
+        mask_uint8 = (mask > 0).astype(np.uint8)
+        opened = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, kernel)
+        processed_masks.append(opened.astype(bool))
+    return np.stack(processed_masks, axis=0)
+
+
+def ensure_masks_batch_first(masks: np.ndarray) -> np.ndarray:
+    arr = np.asarray(masks)
+    if arr.ndim == 4:
+        if arr.shape[-1] == 1:
+            arr = arr[..., 0]
+        elif arr.shape[1] == 1:
+            arr = arr[:, 0]
+        else:
+            raise ValueError(f"Unsupported mask shape {arr.shape} for 4D masks")
+    if arr.ndim == 3 and arr.shape[-1] == 1 and arr.shape[0] != 1:
+        arr = arr[..., 0]
+    if arr.ndim == 2:
+        arr = arr[np.newaxis, ...]
+    if arr.ndim != 3:
+        raise ValueError(f"Cannot normalize mask array with shape {arr.shape}")
+    return arr
 
 # create output directory
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -69,7 +120,13 @@ boxes, confidences, labels = predict(
 h, w, _ = image_source.shape
 boxes = boxes * torch.Tensor([w, h, w, h])
 input_boxes = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
+input_boxes = shrink_boxes_xyxy(input_boxes, BOX_SHRINK_RATIO, w, h)
 
+if input_boxes.size == 0:
+    raise RuntimeError(
+        "Grounding DINO did not return any bounding boxes. "
+        "Consider relaxing box/text thresholds or revising the text prompt."
+    )
 
 # FIXME: figure how does this influence the G-DINO model
 torch.autocast(device_type=DEVICE, dtype=torch.bfloat16).__enter__()
@@ -90,8 +147,12 @@ masks, scores, logits = sam2_predictor.predict(
 Sample the best mask according to the score
 """
 if MULTIMASK_OUTPUT:
-    best = np.argmax(scores, axis=1)                     
-    masks = masks[np.arange(masks.shape[0]), best]       
+    axis = 1 if scores.ndim > 1 else 0
+    best = np.argmax(scores, axis=axis)
+    if masks.ndim == 4:
+        masks = masks[np.arange(masks.shape[0]), best]
+    else:
+        masks = masks[best]
 
 """
 Post-process the output of the model to get the masks, scores, and logits for visualization
@@ -100,6 +161,8 @@ Post-process the output of the model to get the masks, scores, and logits for vi
 if masks.ndim == 4:
     masks = masks.squeeze(1)
 
+masks = apply_morphological_opening(masks, MORPH_KERNEL_SIZE)
+masks = ensure_masks_batch_first(masks)
 
 confidences = confidences.numpy().tolist()
 class_names = labels
@@ -138,7 +201,13 @@ Dump the results in standard format and save as json files
 """
 
 def single_mask_to_rle(mask):
-    rle = mask_util.encode(np.array(mask[:, :, None], order="F", dtype="uint8"))[0]
+    normalized = ensure_masks_batch_first(mask)
+    if normalized.shape[0] != 1:
+        raise ValueError(
+            f"mask must represent exactly one instance, but got shape {normalized.shape}"
+        )
+    mask_2d = normalized[0]
+    rle = mask_util.encode(np.array(mask_2d[np.newaxis, ...], order="F", dtype="uint8"))[0]
     rle["counts"] = rle["counts"].decode("utf-8")
     return rle
 

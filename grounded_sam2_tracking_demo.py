@@ -1,8 +1,14 @@
 import os
+import platform
+
+if platform.system() == "Darwin" and "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ:
+    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 import cv2
 import torch
 import numpy as np
 import supervision as sv
+from contextlib import nullcontext
 from PIL import Image
 from sam2.build_sam import build_sam2_video_predictor, build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -14,26 +20,69 @@ from utils.video_utils import create_video_from_images
 """
 Step 1: Environment settings and model initialization
 """
-# use bfloat16 for the entire notebook
-torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
 
-if torch.cuda.get_device_properties(0).major >= 8:
-    # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+
+def _detect_device() -> str:
+    override = os.environ.get("SAM2_DEVICE", "").lower()
+    if override in {"cuda", "mps", "cpu"}:
+        if override == "cuda" and torch.cuda.is_available():
+            return "cuda"
+        if override == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        if override == "cpu":
+            return "cpu"
+        raise RuntimeError(f"SAM2_DEVICE override '{override}' is not supported on this machine.")
+
+    if torch.cuda.is_available():
+        try:
+            _props = torch.cuda.get_device_properties(0)
+            if _props is not None:
+                return "cuda"
+        except (AssertionError, RuntimeError):
+            pass
+    return "cpu"
+
+
+COMPUTE_DEVICE = _detect_device()
+
+if COMPUTE_DEVICE == "cuda":
+    amp_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    amp_context.__enter__()
+    props = torch.cuda.get_device_properties(0)
+    if props is not None and props.major >= 8:
+        # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+elif COMPUTE_DEVICE == "mps":
+    amp_context = torch.autocast(device_type="mps", dtype=torch.float16)
+    amp_context.__enter__()
+else:
+    amp_context = nullcontext()
+    amp_context.__enter__()
 
 # init sam image predictor and video predictor model
-sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
-model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+SAM2_VARIANTS = {
+    "sam2.1_hiera_large": (
+        "configs/sam2.1/sam2.1_hiera_l.yaml",
+        "./checkpoints/sam2.1_hiera_large.pt",
+    ),
+    "sam2.1_hiera_base_plus": (
+        "configs/sam2.1/sam2.1_hiera_b+.yaml",
+        "./checkpoints/sam2.1_hiera_base_plus.pt",
+    ),
+}
+SAM2_MODEL_VARIANT = "sam2.1_hiera_large"
 
-video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
-sam2_image_model = build_sam2(model_cfg, sam2_checkpoint)
+model_cfg, sam2_checkpoint = SAM2_VARIANTS[SAM2_MODEL_VARIANT]
+
+video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=COMPUTE_DEVICE)
+sam2_image_model = build_sam2(model_cfg, sam2_checkpoint, device=COMPUTE_DEVICE)
 image_predictor = SAM2ImagePredictor(sam2_image_model)
 
 
 # init grounding dino model from huggingface
 model_id = "IDEA-Research/grounding-dino-tiny"
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = COMPUTE_DEVICE if COMPUTE_DEVICE in {"cuda", "mps"} else "cpu"
 processor = AutoProcessor.from_pretrained(model_id)
 grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
 

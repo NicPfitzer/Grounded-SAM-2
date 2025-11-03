@@ -23,20 +23,28 @@
 import glob
 import os
 import subprocess
-
-import subprocess
 import sys
 
-def install_torch():
+
+def ensure_torch():
     try:
         import torch
     except ImportError:
+        try:
+            import pip  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "groundingdino setup cannot import torch and pip is unavailable in the "
+                "current build environment. Install torch in the environment first "
+                "(e.g. `python -m pip install torch`) or re-run the install with "
+                "`PIP_NO_BUILD_ISOLATION=1` so that the existing site-packages are visible."
+            ) from exc
         subprocess.check_call([sys.executable, "-m", "pip", "install", "torch"])
+        import torch
+    return torch
 
-# Call the function to ensure torch is installed
-install_torch()
 
-import torch
+torch = ensure_torch()
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import CUDA_HOME, CppExtension, CUDAExtension
 
