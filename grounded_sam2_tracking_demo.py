@@ -502,15 +502,24 @@ def main(args: argparse.Namespace) -> None:
             masks = np.stack(list(masks_dict.values()), axis=0)
             return frame_idx_local, object_ids, masks
 
+        written_frames: List[int] = []
+        skipped_frames: List[int] = []
+
         for entry in mask_index:
             frame_idx, object_ids, masks = load_frame_masks(entry)
             img = video_frames.get_bgr(frame_idx)
 
-            masks = masks.astype(bool)
+            if len(object_ids) == 0:
+                print(f"[Grounded SAM 2 Tracking][Debug] Frame {frame_idx:05d} has no tracked objects; skipping annotation.")
+                skipped_frames.append(frame_idx)
+                continue
+
+            object_ids_arr = np.array(object_ids, dtype=np.int32)
+            masks_bool = masks.astype(bool)
             detections = sv.Detections(
-                xyxy=sv.mask_to_xyxy(masks),
-                mask=masks,
-                class_id=object_ids,
+                xyxy=sv.mask_to_xyxy(masks_bool),
+                mask=masks_bool,
+                class_id=object_ids_arr,
             )
             box_annotator = sv.BoxAnnotator()
             annotated_frame = box_annotator.annotate(scene=img.copy(), detections=detections)
@@ -518,11 +527,27 @@ def main(args: argparse.Namespace) -> None:
             annotated_frame = label_annotator.annotate(
                 annotated_frame,
                 detections=detections,
-                labels=[ID_TO_OBJECTS[int(i)] for i in object_ids],
+                labels=[ID_TO_OBJECTS[int(i)] for i in object_ids_arr],
             )
             mask_annotator = sv.MaskAnnotator()
             annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
-            cv2.imwrite(os.path.join(save_dir, f"annotated_frame_{frame_idx:05d}.jpg"), annotated_frame)
+
+            output_path = os.path.join(save_dir, f"annotated_frame_{frame_idx:05d}.jpg")
+            if cv2.imwrite(output_path, annotated_frame):
+                written_frames.append(frame_idx)
+            else:
+                print(f"[Grounded SAM 2 Tracking][Debug] Failed to save annotated frame {frame_idx:05d} to {output_path}.")
+                skipped_frames.append(frame_idx)
+
+        print(
+            f"[Grounded SAM 2 Tracking][Debug] Annotated frames written: {len(written_frames)} "
+            f"out of {len(mask_index)} cached frames."
+        )
+        if skipped_frames:
+            print(
+                "[Grounded SAM 2 Tracking][Debug] Frames skipped (no objects or save failure): "
+                + ", ".join(f"{idx:05d}" for idx in skipped_frames)
+            )
 
         if args.output_video:
             output_video_path = args.output_video
