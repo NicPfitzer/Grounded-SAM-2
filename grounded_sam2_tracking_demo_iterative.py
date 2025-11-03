@@ -433,8 +433,10 @@ def main(args: argparse.Namespace) -> None:
                             best_id = obj_id
                     if best_id is not None and best_iou >= args.track_iou_threshold:
                         obj_id = best_id
+                        print(f"[Iterative Tracking] Reusing object {obj_id} at frame {start_idx:05d} (IoU={best_iou:.3f})")
                     else:
                         obj_id = next_object_id
+                        print(f"[Iterative Tracking] New object {obj_id} detected at frame {start_idx:05d}")
                         next_object_id += 1
                     global_objects[obj_id] = ObjectState(mask=mask_np, frame_idx=start_idx, class_name=class_name)
                     class_name_lookup[obj_id] = class_name
