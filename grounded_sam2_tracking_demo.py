@@ -463,12 +463,12 @@ def main(args: argparse.Namespace) -> None:
         in_memory_masks = {}
 
         for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state):
-        frame_masks = {}
-        for i, out_obj_id in enumerate(out_obj_ids):
-            mask_array = (out_mask_logits[i] > 0.0).cpu().numpy()
-            if mask_array.ndim > 2:
-                mask_array = np.squeeze(mask_array, axis=0)
-            frame_masks[out_obj_id] = mask_array
+            frame_masks = {}
+            for i, out_obj_id in enumerate(out_obj_ids):
+                mask_array = (out_mask_logits[i] > 0.0).cpu().numpy()
+                if mask_array.ndim > 2:
+                    mask_array = np.squeeze(mask_array, axis=0)
+                frame_masks[out_obj_id] = mask_array
 
         if args.offload_masks_to_disk:
             cache_path = os.path.join(mask_cache_dir, f"frame_{out_frame_idx:05d}.npz")
