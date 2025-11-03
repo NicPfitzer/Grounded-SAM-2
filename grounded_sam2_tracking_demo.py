@@ -8,6 +8,7 @@ import cv2
 import torch
 import numpy as np
 import supervision as sv
+from typing import List, Optional
 from contextlib import nullcontext
 from PIL import Image
 from sam2.build_sam import build_sam2_video_predictor, build_sam2
@@ -15,6 +16,11 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection 
 from utils.track_utils import sample_points_from_masks
 from utils.video_utils import create_video_from_images
+
+try:
+    import decord  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    decord = None
 
 
 """
@@ -73,6 +79,75 @@ SAM2_VARIANTS = {
 }
 SAM2_MODEL_VARIANT = "sam2.1_hiera_large"
 
+VIDEO_SOURCE = "notebooks/videos/car"  # can be a directory of JPEG frames or a video file (e.g. MP4)
+
+
+class VideoFrames:
+    def __init__(self, source: str):
+        self.source = source
+        self._reader = None
+        self.frame_ids: List[str]
+        if os.path.isdir(source):
+            self.kind = "folder"
+            self.frame_ids = [
+                p
+                for p in os.listdir(source)
+                if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
+            ]
+            if not self.frame_ids:
+                raise RuntimeError(f"No JPEG frames found in directory: {source}")
+            try:
+                self.frame_ids.sort(key=lambda p: int(os.path.splitext(p)[0]))
+            except ValueError:
+                self.frame_ids.sort()
+        elif os.path.isfile(source):
+            if decord is None:
+                raise ImportError(
+                    "Reading video files requires the 'decord' package. "
+                    "Install it with `pip install decord`."
+                )
+            self.kind = "video"
+            decord.bridge.set_bridge("native")
+            self._reader = decord.VideoReader(source)
+            num_frames = len(self._reader)
+            if num_frames == 0:
+                raise RuntimeError(f"No frames decoded from video file: {source}")
+            self.frame_ids = [f"frame_{idx:05d}.jpg" for idx in range(num_frames)]
+        else:
+            raise FileNotFoundError(f"Video source not found: {source}")
+
+    def __len__(self) -> int:
+        return len(self.frame_ids)
+
+    def get_rgb(self, index: int) -> np.ndarray:
+        if self.kind == "folder":
+            frame_path = os.path.join(self.source, self.frame_ids[index])
+            bgr = cv2.imread(frame_path)
+            if bgr is None:
+                raise RuntimeError(f"Failed to read frame from {frame_path}")
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        return self._reader[index].asnumpy()
+
+    def get_bgr(self, index: int) -> np.ndarray:
+        if self.kind == "folder":
+            frame_path = os.path.join(self.source, self.frame_ids[index])
+            bgr = cv2.imread(frame_path)
+            if bgr is None:
+                raise RuntimeError(f"Failed to read frame from {frame_path}")
+            return bgr
+        return cv2.cvtColor(self._reader[index].asnumpy(), cv2.COLOR_RGB2BGR)
+
+    def get_frame_label(self, index: int) -> str:
+        return self.frame_ids[index]
+
+    def get_frame_path(self, index: int) -> Optional[str]:
+        if self.kind == "folder":
+            return os.path.join(self.source, self.frame_ids[index])
+        return None
+
+
+video_frames = VideoFrames(VIDEO_SOURCE)
+
 model_cfg, sam2_checkpoint = SAM2_VARIANTS[SAM2_MODEL_VARIANT]
 
 video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=COMPUTE_DEVICE)
@@ -91,19 +166,11 @@ grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).
 # VERY important: text queries need to be lowercased + end with a dot
 text = "car."
 
-# `video_dir` a directory of JPEG frames with filenames like `<frame_index>.jpg`  
+# total frames available
+num_frames = len(video_frames)
 
-video_dir = "notebooks/videos/bedroom"
-
-# scan all the JPEG frame names in this directory
-frame_names = [
-    p for p in os.listdir(video_dir)
-    if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
-]
-frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
-
-# init video predictor state
-inference_state = video_predictor.init_state(video_path=video_dir)
+# init video predictor state (supports both frame folders and video files)
+inference_state = video_predictor.init_state(video_path=VIDEO_SOURCE)
 
 ann_frame_idx = 0  # the frame index we interact with
 ann_obj_id = 1  # give a unique id to each object we interact with (it can be any integers)
@@ -114,8 +181,8 @@ Step 2: Prompt Grounding DINO and SAM image predictor to get the box and mask fo
 """
 
 # prompt grounding dino to get the box coordinates on specific frame
-img_path = os.path.join(video_dir, frame_names[ann_frame_idx])
-image = Image.open(img_path)
+frame_rgb = video_frames.get_rgb(ann_frame_idx)
+image = Image.fromarray(frame_rgb)
 
 # run Grounding DINO on the image
 inputs = processor(images=image, text=text, return_tensors="pt").to(device)
@@ -131,7 +198,7 @@ results = processor.post_process_grounded_object_detection(
 )
 
 # prompt SAM image predictor to get the mask for the object
-image_predictor.set_image(np.array(image.convert("RGB")))
+image_predictor.set_image(np.array(image))
 
 # process the detection results
 input_boxes = results[0]["boxes"].cpu().numpy()
@@ -219,8 +286,8 @@ if not os.path.exists(save_dir):
 
 ID_TO_OBJECTS = {i: obj for i, obj in enumerate(OBJECTS, start=1)}
 for frame_idx, segments in video_segments.items():
-    img = cv2.imread(os.path.join(video_dir, frame_names[frame_idx]))
-    
+    img = video_frames.get_bgr(frame_idx)
+
     object_ids = list(segments.keys())
     masks = list(segments.values())
     masks = np.concatenate(masks, axis=0)
