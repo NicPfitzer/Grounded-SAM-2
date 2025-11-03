@@ -93,7 +93,7 @@ text = "car."
 
 # `video_dir` a directory of JPEG frames with filenames like `<frame_index>.jpg`  
 
-video_dir = "notebooks/videos/car"
+video_dir = "notebooks/videos/bedroom"
 
 # scan all the JPEG frame names in this directory
 frame_names = [
