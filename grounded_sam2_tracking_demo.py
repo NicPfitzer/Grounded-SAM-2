@@ -122,6 +122,11 @@ def parse_args() -> argparse.Namespace:
         help="Resize Grounding DINO input so the longest image edge is at most this value. "
              "Set to a non-positive number to disable resizing.",
     )
+    parser.add_argument(
+        "--offload-video-to-cpu",
+        action="store_true",
+        help="Keep cached video frames on CPU memory instead of GPU to reduce VRAM usage.",
+    )
     return parser.parse_args()
 
 
@@ -233,7 +238,12 @@ def main(args: argparse.Namespace) -> None:
     processor = AutoProcessor.from_pretrained(model_id)
     grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
 
-    inference_state = video_predictor.init_state(video_path=video_source)
+    offload_video = args.offload_video_to_cpu or (video_frames.kind == "video")
+
+    inference_state = video_predictor.init_state(
+        video_path=video_source,
+        offload_video_to_cpu=offload_video,
+    )
 
     ann_frame_idx = 0
 
