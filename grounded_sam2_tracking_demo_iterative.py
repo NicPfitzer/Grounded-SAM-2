@@ -375,12 +375,12 @@ def main(args: argparse.Namespace) -> None:
         "tiny": "IDEA-Research/grounding-dino-tiny",
     }[args.dino_model]
     processor = AutoProcessor.from_pretrained(dino_id)
-    dino_kwargs = {"torch_dtype": torch.float16} if args.fp16 and device in {"cuda", "mps"} else {}
+    dino_kwargs = {}
+    if args.fp16 and device in {"cuda", "mps"}:
+        dino_kwargs["dtype"] = torch.float16
     grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(
         dino_id, **dino_kwargs
     ).to(device)
-    if args.fp16 and device in {"cuda", "mps"}:
-        grounding_model = grounding_model.half()
 
     inference_state = video_predictor.init_state(
         video_path=video_frames.source,
