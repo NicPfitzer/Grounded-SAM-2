@@ -1,0 +1,33 @@
+
+video_segments = {}
+for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state):
+    video_segments[out_frame_idx] = {
+        out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+        for i, out_obj_id in enumerate(out_obj_ids)
+    }
+
+save_dir = args.output_dir
+os.makedirs(save_dir, exist_ok=True)
+
+ID_TO_OBJECTS = {i: obj for i, obj in enumerate(OBJECTS, start=1)}
+for frame_idx, segments in video_segments.items():
+    img = video_frames.get_bgr(frame_idx)
+
+    object_ids = list(segments.keys())
+    masks = list(segments.values())
+    masks = np.concatenate(masks, axis=0)
+
+    detections = sv.Detections(
+        xyxy=sv.mask_to_xyxy(masks),
+        mask=masks,
+        class_id=np.array(object_ids, dtype=np.int32),
+    )
+    box_annotator = sv.BoxAnnotator()
+    annotated_frame = box_annotator.annotate(scene=img.copy(), detections=detections)
+    label_annotator = sv.LabelAnnotator()
+    annotated_frame = label_annotator.annotate(
+        annotated_frame, detections=detections, labels=[ID_TO_OBJECTS[i] for i in object_ids]
+    )
+    mask_annotator = sv.MaskAnnotator()
+    annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
+    cv2.imwrite(os.path.join(save_dir, f"annotated_frame_{frame_idx:05d}.jpg"), annotated_frame)

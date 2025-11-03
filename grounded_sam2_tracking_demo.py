@@ -8,6 +8,7 @@ if platform.system() == "Darwin" and "PYTORCH_ENABLE_MPS_FALLBACK" not in os.env
 import cv2
 import torch
 import numpy as np
+import json
 import supervision as sv
 from typing import List, Optional
 from contextlib import nullcontext
@@ -126,6 +127,11 @@ def parse_args() -> argparse.Namespace:
         "--offload-video-to-cpu",
         action="store_true",
         help="Keep cached video frames on CPU memory instead of GPU to reduce VRAM usage.",
+    )
+    parser.add_argument(
+        "--offload-masks-to-disk",
+        action="store_true",
+        help="Persist per-frame segmentation masks to disk instead of keeping all in RAM.",
     )
     return parser.parse_args()
 
@@ -318,34 +324,70 @@ def main(args: argparse.Namespace) -> None:
     else:
         raise NotImplementedError("SAM 2 video predictor only support point/box/mask prompts")
 
-    video_segments = {}
+    save_dir = args.output_dir
+    os.makedirs(save_dir, exist_ok=True)
+
+    mask_cache_dir = os.path.join(save_dir, "_mask_cache")
+    os.makedirs(mask_cache_dir, exist_ok=True)
+
+    mask_index = []
+    in_memory_masks = {}
+
     for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state):
-        video_segments[out_frame_idx] = {
+        frame_masks = {
             out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
             for i, out_obj_id in enumerate(out_obj_ids)
         }
 
-    save_dir = args.output_dir
-    os.makedirs(save_dir, exist_ok=True)
+        if args.offload_masks_to_disk:
+            cache_path = os.path.join(mask_cache_dir, f"frame_{out_frame_idx:05d}.npz")
+            np.savez_compressed(
+                cache_path,
+                object_ids=np.array(list(frame_masks.keys()), dtype=np.int32),
+                masks=np.stack(list(frame_masks.values()), axis=0),
+            )
+            mask_index.append(cache_path)
+        else:
+            in_memory_masks[out_frame_idx] = frame_masks
+
+    if args.offload_masks_to_disk:
+        with open(os.path.join(mask_cache_dir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump(mask_index, f, indent=2)
+    else:
+        mask_index = sorted(in_memory_masks.keys())
 
     ID_TO_OBJECTS = {i: obj for i, obj in enumerate(OBJECTS, start=1)}
-    for frame_idx, segments in video_segments.items():
+
+    def load_frame_masks(s):
+        if args.offload_masks_to_disk:
+            data = np.load(s)
+            object_ids = data["object_ids"]
+            masks = data["masks"]
+            frame_idx_local = int(os.path.splitext(os.path.basename(s))[0].split("_")[-1])
+            return frame_idx_local, object_ids, masks
+        frame_idx_local = s
+        masks_dict = in_memory_masks[frame_idx_local]
+        object_ids = np.array(list(masks_dict.keys()), dtype=np.int32)
+        masks = np.stack(list(masks_dict.values()), axis=0)
+        return frame_idx_local, object_ids, masks
+
+    for entry in mask_index:
+        frame_idx, object_ids, masks = load_frame_masks(entry)
         img = video_frames.get_bgr(frame_idx)
 
-        object_ids = list(segments.keys())
-        masks = list(segments.values())
-        masks = np.concatenate(masks, axis=0)
-
+        masks = masks.astype(bool)
         detections = sv.Detections(
             xyxy=sv.mask_to_xyxy(masks),
             mask=masks,
-            class_id=np.array(object_ids, dtype=np.int32),
+            class_id=object_ids,
         )
         box_annotator = sv.BoxAnnotator()
         annotated_frame = box_annotator.annotate(scene=img.copy(), detections=detections)
         label_annotator = sv.LabelAnnotator()
         annotated_frame = label_annotator.annotate(
-            annotated_frame, detections=detections, labels=[ID_TO_OBJECTS[i] for i in object_ids]
+            annotated_frame,
+            detections=detections,
+            labels=[ID_TO_OBJECTS[int(i)] for i in object_ids],
         )
         mask_annotator = sv.MaskAnnotator()
         annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
