@@ -115,6 +115,13 @@ def parse_args() -> argparse.Namespace:
         choices=list(SAM2_VARIANTS.keys()),
         help="Which SAM 2 checkpoint/config variant to use.",
     )
+    parser.add_argument(
+        "--max-dino-long-edge",
+        type=int,
+        default=1024,
+        help="Resize Grounding DINO input so the longest image edge is at most this value. "
+             "Set to a non-positive number to disable resizing.",
+    )
     return parser.parse_args()
 
 
@@ -192,6 +199,21 @@ class VideoFrames:
         return None
 
 
+def resize_longest_edge(image: Image.Image, max_edge: int) -> Image.Image:
+    if max_edge is None or max_edge <= 0:
+        return image
+    width, height = image.size
+    longest = max(width, height)
+    if longest <= max_edge:
+        return image
+    scale = max_edge / float(longest)
+    new_size = (
+        max(1, int(round(width * scale))),
+        max(1, int(round(height * scale))),
+    )
+    return image.resize(new_size, Image.Resampling.BILINEAR)
+
+
 def main(args: argparse.Namespace) -> None:
     video_source = args.video_source
     text_prompt = args.text.strip().lower()
@@ -217,8 +239,9 @@ def main(args: argparse.Namespace) -> None:
 
     frame_rgb = video_frames.get_rgb(ann_frame_idx)
     image = Image.fromarray(frame_rgb)
+    image_for_dino = resize_longest_edge(image, args.max_dino_long_edge)
 
-    inputs = processor(images=image, text=text_prompt, return_tensors="pt").to(device)
+    inputs = processor(images=image_for_dino, text=text_prompt, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = grounding_model(**inputs)
 
