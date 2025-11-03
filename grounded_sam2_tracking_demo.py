@@ -81,7 +81,7 @@ image_predictor = SAM2ImagePredictor(sam2_image_model)
 
 
 # init grounding dino model from huggingface
-model_id = "IDEA-Research/grounding-dino-tiny"
+model_id = "rziga/mm_grounding_dino_large_all"
 device = COMPUTE_DEVICE if COMPUTE_DEVICE in {"cuda", "mps"} else "cpu"
 processor = AutoProcessor.from_pretrained(model_id)
 grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
