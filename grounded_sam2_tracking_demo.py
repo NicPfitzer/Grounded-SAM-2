@@ -470,16 +470,16 @@ def main(args: argparse.Namespace) -> None:
                     mask_array = np.squeeze(mask_array, axis=0)
                 frame_masks[out_obj_id] = mask_array
 
-        if args.offload_masks_to_disk:
-            cache_path = os.path.join(mask_cache_dir, f"frame_{out_frame_idx:05d}.npz")
-            np.savez_compressed(
-                cache_path,
-                object_ids=np.array(list(frame_masks.keys()), dtype=np.int32),
-                masks=np.stack(list(frame_masks.values()), axis=0),
-            )
-            mask_index.append(cache_path)
-        else:
-            in_memory_masks[out_frame_idx] = frame_masks
+            if args.offload_masks_to_disk:
+                cache_path = os.path.join(mask_cache_dir, f"frame_{out_frame_idx:05d}.npz")
+                np.savez_compressed(
+                    cache_path,
+                    object_ids=np.array(list(frame_masks.keys()), dtype=np.int32),
+                    masks=np.stack(list(frame_masks.values()), axis=0),
+                )
+                mask_index.append(cache_path)
+            else:
+                in_memory_masks[out_frame_idx] = frame_masks
 
         if args.offload_masks_to_disk:
             with open(os.path.join(mask_cache_dir, "index.json"), "w", encoding="utf-8") as f:
@@ -505,8 +505,8 @@ def main(args: argparse.Namespace) -> None:
         written_frames: List[int] = []
         skipped_frames: List[int] = []
 
-        for entry in mask_index:
-            print("[Grounded SAM 2 Tracking] Annotating frame:", entry, "out of", len(mask_index))
+        for idx, entry in enumerate(mask_index):
+            print(f"[Grounded SAM 2 Tracking] Annotating frame: {idx+1}/{len(mask_index)} -> {entry}")
             frame_idx, object_ids, masks = load_frame_masks(entry)
             img = video_frames.get_bgr(frame_idx)
 
