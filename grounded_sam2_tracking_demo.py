@@ -1,6 +1,7 @@
 import argparse
 import os
 import tempfile
+import shutil
 import platform
 
 if platform.system() == "Darwin" and "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ:
@@ -113,6 +114,12 @@ def parse_args() -> argparse.Namespace:
         help="Frame rate (frames per second) for the output video.",
     )
     parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Limit the number of video frames processed. Negative or None means use the entire video.",
+    )
+    parser.add_argument(
         "--sam2-variant",
         default=SAM2_MODEL_VARIANT,
         choices=list(SAM2_VARIANTS.keys()),
@@ -124,6 +131,18 @@ def parse_args() -> argparse.Namespace:
         default=1024,
         help="Resize Grounding DINO input so the longest image edge is at most this value. "
              "Set to a non-positive number to disable resizing.",
+    )
+    parser.add_argument(
+        "--source-fps",
+        type=float,
+        default=None,
+        help="Original video frame rate when providing a directory of frames. Required if --target-frame-rate is set for a frame directory.",
+    )
+    parser.add_argument(
+        "--target-frame-rate",
+        type=float,
+        default=None,
+        help="Downsample the video to this frame rate before tracking by dropping frames.",
     )
     parser.add_argument(
         "--offload-video-to-cpu",
@@ -149,8 +168,9 @@ class VideoFrames:
         self.source = source
         self._reader = None
         self.frame_ids: List[str] = []
-        self.temp_dir: Optional[str] = None
+        self.temp_dirs: List[str] = []
         self.original_kind: str
+        self.source_fps: Optional[float] = None
 
         if os.path.isdir(source):
             self.original_kind = "folder"
@@ -184,18 +204,24 @@ class VideoFrames:
                 target_dir = Path(frames_dir)
                 target_dir.mkdir(parents=True, exist_ok=True)
             else:
-                self.temp_dir = tempfile.mkdtemp(prefix="sam2_frames_")
-                target_dir = Path(self.temp_dir)
+                temp_dir = tempfile.mkdtemp(prefix="sam2_frames_")
+                self.temp_dirs.append(temp_dir)
+                target_dir = Path(temp_dir)
+
+            decord.bridge.set_bridge("native")
+            reader = decord.VideoReader(source)
+            if len(reader) == 0:
+                raise RuntimeError(f"No frames decoded from video file: {source}")
+            try:
+                self.source_fps = float(reader.get_avg_fps())
+            except Exception:
+                self.source_fps = None
 
             existing_frames = sorted(
                 [p.name for p in target_dir.glob("*.jpg")]
             )
             if not existing_frames:
                 print(f"[VideoFrames] Extracting frames from {source} to {target_dir}")
-                decord.bridge.set_bridge("native")
-                reader = decord.VideoReader(source)
-                if len(reader) == 0:
-                    raise RuntimeError(f"No frames decoded from video file: {source}")
                 for idx, frame in enumerate(reader):
                     frame_np = frame.asnumpy() if hasattr(frame, "asnumpy") else frame.numpy()
                     frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
@@ -219,6 +245,48 @@ class VideoFrames:
                 self.frame_ids.sort()
         else:
             raise FileNotFoundError(f"Video source not found: {source}")
+
+    def _switch_to_subset(self, selected_frames: List[str]) -> None:
+        subset_dir = Path(tempfile.mkdtemp(prefix="sam2_frame_subset_"))
+        self.temp_dirs.append(str(subset_dir))
+        source_path = Path(self.source)
+        for name in selected_frames:
+            src = source_path / name
+            dst = subset_dir / name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        self.source = str(subset_dir)
+        self.frame_ids = list(selected_frames)
+        self.kind = "folder"
+
+    def limit_frames(self, max_frames: Optional[int]) -> None:
+        if max_frames is None or max_frames <= 0:
+            return
+        if len(self.frame_ids) <= max_frames:
+            return
+
+        selected = list(self.frame_ids[:max_frames])
+        self._switch_to_subset(selected)
+
+    def downsample_to_fps(self, target_fps: Optional[float], source_fps_override: Optional[float]) -> None:
+        if target_fps is None or target_fps <= 0:
+            return
+        source_fps = self.source_fps if self.source_fps is not None else source_fps_override
+        if source_fps is None:
+            raise ValueError(
+                "target-frame-rate is set but source FPS is unknown. "
+                "Provide --source-fps when using a frames directory."
+            )
+        if target_fps >= source_fps:
+            return
+        stride = max(1, int(round(source_fps / target_fps)))
+        if stride <= 1:
+            return
+        selected = [name for idx, name in enumerate(self.frame_ids) if idx % stride == 0]
+        if not selected:
+            selected = [self.frame_ids[0]]
+        self._switch_to_subset(selected)
+        self.source_fps = source_fps / stride
 
     def __len__(self) -> int:
         return len(self.frame_ids)
@@ -253,6 +321,13 @@ class VideoFrames:
             return os.path.join(self.source, self.frame_ids[index])
         return None
 
+    def cleanup(self) -> None:
+        for temp_path in self.temp_dirs:
+            shutil.rmtree(temp_path, ignore_errors=True)
+
+    def __del__(self):
+        self.cleanup()
+
 
 def resize_longest_edge(image: Image.Image, max_edge: int) -> Image.Image:
     if max_edge is None or max_edge <= 0:
@@ -276,119 +351,124 @@ def main(args: argparse.Namespace) -> None:
         text_prompt = f"{text_prompt}."
 
     video_frames = VideoFrames(video_source, frames_dir=args.frames_dir)
+    video_frames.downsample_to_fps(args.target_frame_rate, args.source_fps)
+    video_frames.limit_frames(args.max_frames)
 
-    model_cfg, sam2_checkpoint = SAM2_VARIANTS[args.sam2_variant]
+    try:
+        model_cfg, sam2_checkpoint = SAM2_VARIANTS[args.sam2_variant]
 
-    video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=COMPUTE_DEVICE)
-    sam2_image_model = build_sam2(model_cfg, sam2_checkpoint, device=COMPUTE_DEVICE)
-    image_predictor = SAM2ImagePredictor(sam2_image_model)
+        video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=COMPUTE_DEVICE)
+        sam2_image_model = build_sam2(model_cfg, sam2_checkpoint, device=COMPUTE_DEVICE)
+        image_predictor = SAM2ImagePredictor(sam2_image_model)
 
-    model_id = "rziga/mm_grounding_dino_large_all"
-    device = COMPUTE_DEVICE if COMPUTE_DEVICE in {"cuda", "mps"} else "cpu"
-    processor = AutoProcessor.from_pretrained(model_id)
-    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
+        model_id = "rziga/mm_grounding_dino_large_all"
+        device = COMPUTE_DEVICE if COMPUTE_DEVICE in {"cuda", "mps"} else "cpu"
+        processor = AutoProcessor.from_pretrained(model_id)
+        grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
 
-    offload_video = args.offload_video_to_cpu or (video_frames.original_kind == "video_file")
+        offload_video = args.offload_video_to_cpu or (video_frames.original_kind == "video_file")
 
-    inference_state = video_predictor.init_state(
-        video_path=video_frames.source,
-        offload_video_to_cpu=offload_video,
-    )
-
-    ann_frame_idx = 0
-
-    frame_rgb = video_frames.get_rgb(ann_frame_idx)
-    image = Image.fromarray(frame_rgb)
-    image_for_dino = resize_longest_edge(image, args.max_dino_long_edge)
-
-    inputs = processor(images=image_for_dino, text=text_prompt, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = grounding_model(**inputs)
-
-    results = processor.post_process_grounded_object_detection(
-        outputs,
-        inputs.input_ids,
-        threshold=0.25,
-        text_threshold=0.3,
-        target_sizes=[image.size[::-1]],
-    )
-
-    image_predictor.set_image(np.array(image))
-
-    input_boxes = results[0]["boxes"].cpu().numpy()
-    OBJECTS = results[0]["labels"]
-
-    if input_boxes.size == 0:
-        print(
-            "[Grounded SAM 2 Tracking] No detections returned by Grounding DINO. "
-            "Adjust the text/thresholds or provide an initial bounding box before running tracking."
+        inference_state = video_predictor.init_state(
+            video_path=video_frames.source,
+            offload_video_to_cpu=offload_video,
         )
-        return
 
-    masks, scores, logits = image_predictor.predict(
-        point_coords=None,
-        point_labels=None,
-        box=input_boxes,
-        multimask_output=False,
-    )
+        ann_frame_idx = 0
 
-    if masks.ndim == 3:
-        masks = masks[None]
-        scores = scores[None]
-        logits = logits[None]
-    elif masks.ndim == 4:
-        masks = masks.squeeze(1)
+        frame_rgb = video_frames.get_rgb(ann_frame_idx)
+        image = Image.fromarray(frame_rgb)
+        image_for_dino = resize_longest_edge(image, args.max_dino_long_edge)
 
-    PROMPT_TYPE_FOR_VIDEO = "box"
+        inputs = processor(images=image_for_dino, text=text_prompt, return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = grounding_model(**inputs)
 
-    assert PROMPT_TYPE_FOR_VIDEO in ["point", "box", "mask"], "SAM 2 video predictor only support point/box/mask prompt"
+        results = processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            threshold=0.25,
+            text_threshold=0.3,
+            target_sizes=[image.size[::-1]],
+        )
 
-    if PROMPT_TYPE_FOR_VIDEO == "point":
-        all_sample_points = sample_points_from_masks(masks=masks, num_points=10)
+        image_predictor.set_image(np.array(image))
 
-        for object_id, (label, points) in enumerate(zip(OBJECTS, all_sample_points), start=1):
-            labels = np.ones((points.shape[0]), dtype=np.int32)
-            _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=ann_frame_idx,
-                obj_id=object_id,
-                points=points,
-                labels=labels,
+        input_boxes = results[0]["boxes"].cpu().numpy()
+        OBJECTS = results[0]["labels"]
+
+        if input_boxes.size == 0:
+            print(
+                "[Grounded SAM 2 Tracking] No detections returned by Grounding DINO. "
+                "Adjust the text/thresholds or provide an initial bounding box before running tracking."
             )
-    elif PROMPT_TYPE_FOR_VIDEO == "box":
-        for object_id, (label, box) in enumerate(zip(OBJECTS, input_boxes), start=1):
-            _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=ann_frame_idx,
-                obj_id=object_id,
-                box=box,
-            )
-    elif PROMPT_TYPE_FOR_VIDEO == "mask":
-        for object_id, (label, mask) in enumerate(zip(OBJECTS, masks), start=1):
-            labels = np.ones((1), dtype=np.int32)
-            _, out_obj_ids, out_mask_logits = video_predictor.add_new_mask(
-                inference_state=inference_state,
-                frame_idx=ann_frame_idx,
-                obj_id=object_id,
-                mask=mask,
-            )
-    else:
-        raise NotImplementedError("SAM 2 video predictor only support point/box/mask prompts")
+            return
 
-    save_dir = args.output_dir
-    os.makedirs(save_dir, exist_ok=True)
+        masks, scores, logits = image_predictor.predict(
+            point_coords=None,
+            point_labels=None,
+            box=input_boxes,
+            multimask_output=False,
+        )
 
-    mask_cache_dir = os.path.join(save_dir, "_mask_cache")
-    os.makedirs(mask_cache_dir, exist_ok=True)
+        if masks.ndim == 3:
+            masks = masks[None]
+            scores = scores[None]
+            logits = logits[None]
+        elif masks.ndim == 4:
+            masks = masks.squeeze(1)
 
-    mask_index = []
-    in_memory_masks = {}
+        PROMPT_TYPE_FOR_VIDEO = "box"
 
-    for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state):
-        frame_masks = {
-            out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-            for i, out_obj_id in enumerate(out_obj_ids)
-        }
+        assert PROMPT_TYPE_FOR_VIDEO in ["point", "box", "mask"], "SAM 2 video predictor only support point/box/mask prompts"
+
+        if PROMPT_TYPE_FOR_VIDEO == "point":
+            all_sample_points = sample_points_from_masks(masks=masks, num_points=10)
+
+            for object_id, (label, points) in enumerate(zip(OBJECTS, all_sample_points), start=1):
+                labels = np.ones((points.shape[0]), dtype=np.int32)
+                _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=ann_frame_idx,
+                    obj_id=object_id,
+                    points=points,
+                    labels=labels,
+                )
+        elif PROMPT_TYPE_FOR_VIDEO == "box":
+            for object_id, (label, box) in enumerate(zip(OBJECTS, input_boxes), start=1):
+                _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=ann_frame_idx,
+                    obj_id=object_id,
+                    box=box,
+                )
+        elif PROMPT_TYPE_FOR_VIDEO == "mask":
+            for object_id, (label, mask) in enumerate(zip(OBJECTS, masks), start=1):
+                labels = np.ones((1), dtype=np.int32)
+                _, out_obj_ids, out_mask_logits = video_predictor.add_new_mask(
+                    inference_state=inference_state,
+                    frame_idx=ann_frame_idx,
+                    obj_id=object_id,
+                    mask=mask,
+                )
+        else:
+            raise NotImplementedError("SAM 2 video predictor only support point/box/mask prompts")
+
+        save_dir = args.output_dir
+        os.makedirs(save_dir, exist_ok=True)
+
+        mask_cache_dir = os.path.join(save_dir, "_mask_cache")
+        os.makedirs(mask_cache_dir, exist_ok=True)
+
+        mask_index = []
+        in_memory_masks = {}
+
+        for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state):
+        frame_masks = {}
+        for i, out_obj_id in enumerate(out_obj_ids):
+            mask_array = (out_mask_logits[i] > 0.0).cpu().numpy()
+            if mask_array.ndim > 2:
+                mask_array = np.squeeze(mask_array, axis=0)
+            frame_masks[out_obj_id] = mask_array
 
         if args.offload_masks_to_disk:
             cache_path = os.path.join(mask_cache_dir, f"frame_{out_frame_idx:05d}.npz")
@@ -401,58 +481,60 @@ def main(args: argparse.Namespace) -> None:
         else:
             in_memory_masks[out_frame_idx] = frame_masks
 
-    if args.offload_masks_to_disk:
-        with open(os.path.join(mask_cache_dir, "index.json"), "w", encoding="utf-8") as f:
-            json.dump(mask_index, f, indent=2)
-    else:
-        mask_index = sorted(in_memory_masks.keys())
-
-    ID_TO_OBJECTS = {i: obj for i, obj in enumerate(OBJECTS, start=1)}
-
-    def load_frame_masks(s):
         if args.offload_masks_to_disk:
-            data = np.load(s)
-            object_ids = data["object_ids"]
-            masks = data["masks"]
-            frame_idx_local = int(os.path.splitext(os.path.basename(s))[0].split("_")[-1])
+            with open(os.path.join(mask_cache_dir, "index.json"), "w", encoding="utf-8") as f:
+                json.dump(mask_index, f, indent=2)
+        else:
+            mask_index = sorted(in_memory_masks.keys())
+
+        ID_TO_OBJECTS = {i: obj for i, obj in enumerate(OBJECTS, start=1)}
+
+        def load_frame_masks(s):
+            if args.offload_masks_to_disk:
+                data = np.load(s)
+                object_ids = data["object_ids"]
+                masks = data["masks"]
+                frame_idx_local = int(os.path.splitext(os.path.basename(s))[0].split("_")[-1])
+                return frame_idx_local, object_ids, masks
+            frame_idx_local = s
+            masks_dict = in_memory_masks[frame_idx_local]
+            object_ids = np.array(list(masks_dict.keys()), dtype=np.int32)
+            masks = np.stack(list(masks_dict.values()), axis=0)
             return frame_idx_local, object_ids, masks
-        frame_idx_local = s
-        masks_dict = in_memory_masks[frame_idx_local]
-        object_ids = np.array(list(masks_dict.keys()), dtype=np.int32)
-        masks = np.stack(list(masks_dict.values()), axis=0)
-        return frame_idx_local, object_ids, masks
 
-    for entry in mask_index:
-        frame_idx, object_ids, masks = load_frame_masks(entry)
-        img = video_frames.get_bgr(frame_idx)
+        for entry in mask_index:
+            frame_idx, object_ids, masks = load_frame_masks(entry)
+            img = video_frames.get_bgr(frame_idx)
 
-        masks = masks.astype(bool)
-        detections = sv.Detections(
-            xyxy=sv.mask_to_xyxy(masks),
-            mask=masks,
-            class_id=object_ids,
-        )
-        box_annotator = sv.BoxAnnotator()
-        annotated_frame = box_annotator.annotate(scene=img.copy(), detections=detections)
-        label_annotator = sv.LabelAnnotator()
-        annotated_frame = label_annotator.annotate(
-            annotated_frame,
-            detections=detections,
-            labels=[ID_TO_OBJECTS[int(i)] for i in object_ids],
-        )
-        mask_annotator = sv.MaskAnnotator()
-        annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
-        cv2.imwrite(os.path.join(save_dir, f"annotated_frame_{frame_idx:05d}.jpg"), annotated_frame)
+            masks = masks.astype(bool)
+            detections = sv.Detections(
+                xyxy=sv.mask_to_xyxy(masks),
+                mask=masks,
+                class_id=object_ids,
+            )
+            box_annotator = sv.BoxAnnotator()
+            annotated_frame = box_annotator.annotate(scene=img.copy(), detections=detections)
+            label_annotator = sv.LabelAnnotator()
+            annotated_frame = label_annotator.annotate(
+                annotated_frame,
+                detections=detections,
+                labels=[ID_TO_OBJECTS[int(i)] for i in object_ids],
+            )
+            mask_annotator = sv.MaskAnnotator()
+            annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
+            cv2.imwrite(os.path.join(save_dir, f"annotated_frame_{frame_idx:05d}.jpg"), annotated_frame)
 
-    if args.output_video:
-        output_video_path = args.output_video
-    else:
-        video_stem = os.path.splitext(os.path.basename(video_source.rstrip(os.sep)))[0]
-        if not video_stem:
-            video_stem = "tracking_output"
-        output_video_path = os.path.join(".", f"grounded_sam2_tracking_{video_stem}.mp4")
+        if args.output_video:
+            output_video_path = args.output_video
+        else:
+            video_stem = os.path.splitext(os.path.basename(video_source.rstrip(os.sep)))[0]
+            if not video_stem:
+                video_stem = "tracking_output"
+            output_video_path = os.path.join(".", f"grounded_sam2_tracking_{video_stem}.mp4")
 
-    create_video_from_images(save_dir, output_video_path, frame_rate=args.frame_rate)
+        create_video_from_images(save_dir, output_video_path, frame_rate=args.frame_rate)
+    finally:
+        video_frames.cleanup()
 
 
 if __name__ == "__main__":
