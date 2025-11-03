@@ -379,6 +379,8 @@ def main(args: argparse.Namespace) -> None:
     grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(
         dino_id, **dino_kwargs
     ).to(device)
+    if args.fp16 and device in {"cuda", "mps"}:
+        grounding_model = grounding_model.half()
 
     inference_state = video_predictor.init_state(
         video_path=video_frames.source,
@@ -412,10 +414,10 @@ def main(args: argparse.Namespace) -> None:
             inputs = {}
             for key, value in raw_inputs.items():
                 if isinstance(value, torch.Tensor):
-                    if args.fp16 and device in {"cuda", "mps"} and value.is_floating_point():
-                        inputs[key] = value.to(device=device, dtype=torch.float16)
-                    else:
-                        inputs[key] = value.to(device)
+                    tensor = value.to(device)
+                    if args.fp16 and device in {"cuda", "mps"} and tensor.is_floating_point():
+                        tensor = tensor.to(dtype=torch.float16)
+                    inputs[key] = tensor
                 else:
                     inputs[key] = value
             with torch.no_grad():
@@ -423,7 +425,7 @@ def main(args: argparse.Namespace) -> None:
 
             results = processor.post_process_grounded_object_detection(
                 outputs,
-                inputs.input_ids,
+                inputs["input_ids"],
                 threshold=args.prompt_threshold,
                 text_threshold=args.prompt_text_threshold,
                 target_sizes=[image.size[::-1]],
