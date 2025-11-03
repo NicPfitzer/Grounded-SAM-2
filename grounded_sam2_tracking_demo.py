@@ -79,7 +79,7 @@ SAM2_VARIANTS = {
 }
 SAM2_MODEL_VARIANT = "sam2.1_hiera_large"
 
-VIDEO_SOURCE = "notebooks/videos/car"  # can be a directory of JPEG frames or a video file (e.g. MP4)
+VIDEO_SOURCE = "notebooks/videos/car"  # can be a directory of JPEG frames or a video file (MP4, MOV, M4V)
 
 
 class VideoFrames:
@@ -105,6 +105,12 @@ class VideoFrames:
                 raise ImportError(
                     "Reading video files requires the 'decord' package. "
                     "Install it with `pip install decord`."
+                )
+            ext = os.path.splitext(source)[-1].lower()
+            supported_exts = {".mp4", ".mov", ".m4v"}
+            if ext not in supported_exts:
+                raise ValueError(
+                    f"Unsupported video extension '{ext}'. Supported video formats: {supported_exts}"
                 )
             self.kind = "video"
             decord.bridge.set_bridge("native")
@@ -310,5 +316,8 @@ for frame_idx, segments in video_segments.items():
 Step 6: Convert the annotated frames to video
 """
 
-output_video_path = "./children_tracking_demo_video.mp4"
+video_stem = os.path.splitext(os.path.basename(VIDEO_SOURCE.rstrip(os.sep)))[0]
+if not video_stem:
+    video_stem = "tracking_output"
+output_video_path = os.path.join(".", f"grounded_sam2_tracking_{video_stem}.mp4")
 create_video_from_images(save_dir, output_video_path)
