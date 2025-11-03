@@ -1,5 +1,6 @@
 import argparse
 import os
+import tempfile
 import platform
 
 if platform.system() == "Darwin" and "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ:
@@ -12,6 +13,7 @@ import json
 import supervision as sv
 from typing import List, Optional
 from contextlib import nullcontext
+from pathlib import Path
 from PIL import Image
 from sam2.build_sam import build_sam2_video_predictor, build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -129,6 +131,12 @@ def parse_args() -> argparse.Namespace:
         help="Keep cached video frames on CPU memory instead of GPU to reduce VRAM usage.",
     )
     parser.add_argument(
+        "--frames-dir",
+        default=None,
+        help="Directory to store extracted JPEG frames when decoding a video file. "
+             "If not provided, a temporary directory is used.",
+    )
+    parser.add_argument(
         "--offload-masks-to-disk",
         action="store_true",
         help="Persist per-frame segmentation masks to disk instead of keeping all in RAM.",
@@ -137,11 +145,15 @@ def parse_args() -> argparse.Namespace:
 
 
 class VideoFrames:
-    def __init__(self, source: str):
+    def __init__(self, source: str, frames_dir: Optional[str] = None):
         self.source = source
         self._reader = None
-        self.frame_ids: List[str]
+        self.frame_ids: List[str] = []
+        self.temp_dir: Optional[str] = None
+        self.original_kind: str
+
         if os.path.isdir(source):
+            self.original_kind = "folder"
             self.kind = "folder"
             self.frame_ids = [
                 p
@@ -166,13 +178,45 @@ class VideoFrames:
                 raise ValueError(
                     f"Unsupported video extension '{ext}'. Supported video formats: {supported_exts}"
                 )
-            self.kind = "video"
-            decord.bridge.set_bridge("native")
-            self._reader = decord.VideoReader(source)
-            num_frames = len(self._reader)
-            if num_frames == 0:
-                raise RuntimeError(f"No frames decoded from video file: {source}")
-            self.frame_ids = [f"frame_{idx:05d}.jpg" for idx in range(num_frames)]
+            self.original_kind = "video_file"
+            target_dir: Path
+            if frames_dir:
+                target_dir = Path(frames_dir)
+                target_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                self.temp_dir = tempfile.mkdtemp(prefix="sam2_frames_")
+                target_dir = Path(self.temp_dir)
+
+            existing_frames = sorted(
+                [p.name for p in target_dir.glob("*.jpg")]
+            )
+            if not existing_frames:
+                print(f"[VideoFrames] Extracting frames from {source} to {target_dir}")
+                decord.bridge.set_bridge("native")
+                reader = decord.VideoReader(source)
+                if len(reader) == 0:
+                    raise RuntimeError(f"No frames decoded from video file: {source}")
+                for idx, frame in enumerate(reader):
+                    frame_np = frame.asnumpy() if hasattr(frame, "asnumpy") else frame.numpy()
+                    frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+                    frame_path = target_dir / f"{idx:05d}.jpg"
+                    if not cv2.imwrite(str(frame_path), frame_bgr):
+                        raise RuntimeError(f"Failed to write frame to {frame_path}")
+                existing_frames = sorted(p.name for p in target_dir.glob("*.jpg"))
+                print(f"[VideoFrames] Extracted {len(existing_frames)} frames.")
+            else:
+                print(f"[VideoFrames] Reusing {len(existing_frames)} existing frames in {target_dir}")
+
+            if not existing_frames:
+                raise RuntimeError(f"No frames available after extracting from video: {source}")
+
+            self.kind = "folder"
+            self.source = str(target_dir)
+            self.frame_ids = existing_frames
+            try:
+                self.frame_ids.sort(key=lambda p: int(Path(p).stem))
+            except ValueError:
+                self.frame_ids.sort()
         else:
             raise FileNotFoundError(f"Video source not found: {source}")
 
@@ -231,7 +275,7 @@ def main(args: argparse.Namespace) -> None:
     if not text_prompt.endswith("."):
         text_prompt = f"{text_prompt}."
 
-    video_frames = VideoFrames(video_source)
+    video_frames = VideoFrames(video_source, frames_dir=args.frames_dir)
 
     model_cfg, sam2_checkpoint = SAM2_VARIANTS[args.sam2_variant]
 
@@ -244,10 +288,10 @@ def main(args: argparse.Namespace) -> None:
     processor = AutoProcessor.from_pretrained(model_id)
     grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
 
-    offload_video = args.offload_video_to_cpu or (video_frames.kind == "video")
+    offload_video = args.offload_video_to_cpu or (video_frames.original_kind == "video_file")
 
     inference_state = video_predictor.init_state(
-        video_path=video_source,
+        video_path=video_frames.source,
         offload_video_to_cpu=offload_video,
     )
 
