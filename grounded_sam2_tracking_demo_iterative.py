@@ -357,9 +357,9 @@ def main(args: argparse.Namespace) -> None:
     sam2_image_model = build_sam2(model_cfg, sam2_checkpoint, device=device)
     image_predictor = SAM2ImagePredictor(sam2_image_model)
 
-    processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-tiny")
+    processor = AutoProcessor.from_pretrained("rziga/mm_grounding_dino_large_all")
     grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(
-        "IDEA-Research/grounding-dino-tiny"
+        "rziga/mm_grounding_dino_large_all"
     ).to(device)
 
     inference_state = video_predictor.init_state(
