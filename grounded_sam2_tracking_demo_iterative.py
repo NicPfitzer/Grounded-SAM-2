@@ -106,6 +106,12 @@ def parse_args() -> argparse.Namespace:
         help="Which SAM 2 checkpoint/config variant to use.",
     )
     parser.add_argument(
+        "--dino-model",
+        default="large",
+        choices=["large", "tiny"],
+        help="Grounding DINO checkpoint to use ('large' = rziga/mm_grounding_dino_large_all, 'tiny' = IDEA-Research/grounding-dino-tiny).",
+    )
+    parser.add_argument(
         "--max-dino-long-edge",
         type=int,
         default=1024,
@@ -357,10 +363,12 @@ def main(args: argparse.Namespace) -> None:
     sam2_image_model = build_sam2(model_cfg, sam2_checkpoint, device=device)
     image_predictor = SAM2ImagePredictor(sam2_image_model)
 
-    processor = AutoProcessor.from_pretrained("rziga/mm_grounding_dino_large_all")
-    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(
-        "rziga/mm_grounding_dino_large_all"
-    ).to(device)
+    dino_id = {
+        "large": "rziga/mm_grounding_dino_large_all",
+        "tiny": "IDEA-Research/grounding-dino-tiny",
+    }[args.dino_model]
+    processor = AutoProcessor.from_pretrained(dino_id)
+    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(dino_id).to(device)
 
     inference_state = video_predictor.init_state(
         video_path=video_frames.source,
