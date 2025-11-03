@@ -403,7 +403,10 @@ def main(args: argparse.Namespace) -> None:
             )
 
             detections = []
-            if len(results[0]["boxes"]) > 0:
+            num_candidates = len(results[0]["boxes"])
+            print(f"[Iterative Tracking] DINO detections at frame {start_idx:05d}: {num_candidates}")
+
+            if num_candidates > 0:
                 image_predictor.set_image(np.array(image))
                 boxes = results[0]["boxes"].cpu().numpy()
                 labels = results[0]["labels"]
