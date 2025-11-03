@@ -1,3 +1,4 @@
+import argparse
 import os
 import platform
 
@@ -79,7 +80,36 @@ SAM2_VARIANTS = {
 }
 SAM2_MODEL_VARIANT = "sam2.1_hiera_large"
 
-VIDEO_SOURCE = "notebooks/videos/car"  # can be a directory of JPEG frames or a video file (MP4, MOV, M4V)
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Grounded SAM 2 tracking demo")
+    parser.add_argument(
+        "--video-source",
+        required=True,
+        help="Path to a directory of JPEG frames or a video file (MP4, MOV, M4V).",
+    )
+    parser.add_argument(
+        "--text",
+        default="car.",
+        help="Text prompt passed to Grounding DINO (must be lowercase and end with a dot).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="./tracking_results",
+        help="Directory where annotated frames will be written.",
+    )
+    parser.add_argument(
+        "--output-video",
+        default=None,
+        help="Optional path for the output video. If not set, a name is derived from the source.",
+    )
+    parser.add_argument(
+        "--sam2-variant",
+        default=SAM2_MODEL_VARIANT,
+        choices=list(SAM2_VARIANTS.keys()),
+        help="Which SAM 2 checkpoint/config variant to use.",
+    )
+    return parser.parse_args()
 
 
 class VideoFrames:
@@ -152,172 +182,142 @@ class VideoFrames:
         return None
 
 
-video_frames = VideoFrames(VIDEO_SOURCE)
+def main(args: argparse.Namespace) -> None:
+    video_source = args.video_source
+    text_prompt = args.text.strip().lower()
+    if not text_prompt.endswith("."):
+        text_prompt = f"{text_prompt}."
 
-model_cfg, sam2_checkpoint = SAM2_VARIANTS[SAM2_MODEL_VARIANT]
+    video_frames = VideoFrames(video_source)
 
-video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=COMPUTE_DEVICE)
-sam2_image_model = build_sam2(model_cfg, sam2_checkpoint, device=COMPUTE_DEVICE)
-image_predictor = SAM2ImagePredictor(sam2_image_model)
+    model_cfg, sam2_checkpoint = SAM2_VARIANTS[args.sam2_variant]
 
+    video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=COMPUTE_DEVICE)
+    sam2_image_model = build_sam2(model_cfg, sam2_checkpoint, device=COMPUTE_DEVICE)
+    image_predictor = SAM2ImagePredictor(sam2_image_model)
 
-# init grounding dino model from huggingface
-model_id = "rziga/mm_grounding_dino_large_all"
-device = COMPUTE_DEVICE if COMPUTE_DEVICE in {"cuda", "mps"} else "cpu"
-processor = AutoProcessor.from_pretrained(model_id)
-grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
+    model_id = "rziga/mm_grounding_dino_large_all"
+    device = COMPUTE_DEVICE if COMPUTE_DEVICE in {"cuda", "mps"} else "cpu"
+    processor = AutoProcessor.from_pretrained(model_id)
+    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
 
+    inference_state = video_predictor.init_state(video_path=video_source)
 
-# setup the input image and text prompt for SAM 2 and Grounding DINO
-# VERY important: text queries need to be lowercased + end with a dot
-text = "car."
+    ann_frame_idx = 0
 
-# total frames available
-num_frames = len(video_frames)
+    frame_rgb = video_frames.get_rgb(ann_frame_idx)
+    image = Image.fromarray(frame_rgb)
 
-# init video predictor state (supports both frame folders and video files)
-inference_state = video_predictor.init_state(video_path=VIDEO_SOURCE)
+    inputs = processor(images=image, text=text_prompt, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = grounding_model(**inputs)
 
-ann_frame_idx = 0  # the frame index we interact with
-ann_obj_id = 1  # give a unique id to each object we interact with (it can be any integers)
-
-
-"""
-Step 2: Prompt Grounding DINO and SAM image predictor to get the box and mask for specific frame
-"""
-
-# prompt grounding dino to get the box coordinates on specific frame
-frame_rgb = video_frames.get_rgb(ann_frame_idx)
-image = Image.fromarray(frame_rgb)
-
-# run Grounding DINO on the image
-inputs = processor(images=image, text=text, return_tensors="pt").to(device)
-with torch.no_grad():
-    outputs = grounding_model(**inputs)
-
-results = processor.post_process_grounded_object_detection(
-    outputs,
-    inputs.input_ids,
-    threshold=0.25,
-    text_threshold=0.3,
-    target_sizes=[image.size[::-1]]
-)
-
-# prompt SAM image predictor to get the mask for the object
-image_predictor.set_image(np.array(image))
-
-# process the detection results
-input_boxes = results[0]["boxes"].cpu().numpy()
-OBJECTS = results[0]["labels"]
-
-# prompt SAM 2 image predictor to get the mask for the object
-masks, scores, logits = image_predictor.predict(
-    point_coords=None,
-    point_labels=None,
-    box=input_boxes,
-    multimask_output=False,
-)
-
-# convert the mask shape to (n, H, W)
-if masks.ndim == 3:
-    masks = masks[None]
-    scores = scores[None]
-    logits = logits[None]
-elif masks.ndim == 4:
-    masks = masks.squeeze(1)
-
-"""
-Step 3: Register each object's positive points to video predictor with seperate add_new_points call
-"""
-
-PROMPT_TYPE_FOR_VIDEO = "box" # or "point"
-
-assert PROMPT_TYPE_FOR_VIDEO in ["point", "box", "mask"], "SAM 2 video predictor only support point/box/mask prompt"
-
-# If you are using point prompts, we uniformly sample positive points based on the mask
-if PROMPT_TYPE_FOR_VIDEO == "point":
-    # sample the positive points from mask for each objects
-    all_sample_points = sample_points_from_masks(masks=masks, num_points=10)
-
-    for object_id, (label, points) in enumerate(zip(OBJECTS, all_sample_points), start=1):
-        labels = np.ones((points.shape[0]), dtype=np.int32)
-        _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
-            inference_state=inference_state,
-            frame_idx=ann_frame_idx,
-            obj_id=object_id,
-            points=points,
-            labels=labels,
-        )
-# Using box prompt
-elif PROMPT_TYPE_FOR_VIDEO == "box":
-    for object_id, (label, box) in enumerate(zip(OBJECTS, input_boxes), start=1):
-        _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
-            inference_state=inference_state,
-            frame_idx=ann_frame_idx,
-            obj_id=object_id,
-            box=box,
-        )
-# Using mask prompt is a more straightforward way
-elif PROMPT_TYPE_FOR_VIDEO == "mask":
-    for object_id, (label, mask) in enumerate(zip(OBJECTS, masks), start=1):
-        labels = np.ones((1), dtype=np.int32)
-        _, out_obj_ids, out_mask_logits = video_predictor.add_new_mask(
-            inference_state=inference_state,
-            frame_idx=ann_frame_idx,
-            obj_id=object_id,
-            mask=mask
-        )
-else:
-    raise NotImplementedError("SAM 2 video predictor only support point/box/mask prompts")
-
-
-"""
-Step 4: Propagate the video predictor to get the segmentation results for each frame
-"""
-video_segments = {}  # video_segments contains the per-frame segmentation results
-for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state):
-    video_segments[out_frame_idx] = {
-        out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-        for i, out_obj_id in enumerate(out_obj_ids)
-    }
-
-"""
-Step 5: Visualize the segment results across the video and save them
-"""
-
-save_dir = "./tracking_results"
-
-if not os.path.exists(save_dir):
-    os.makedirs(save_dir)
-
-ID_TO_OBJECTS = {i: obj for i, obj in enumerate(OBJECTS, start=1)}
-for frame_idx, segments in video_segments.items():
-    img = video_frames.get_bgr(frame_idx)
-
-    object_ids = list(segments.keys())
-    masks = list(segments.values())
-    masks = np.concatenate(masks, axis=0)
-    
-    detections = sv.Detections(
-        xyxy=sv.mask_to_xyxy(masks),  # (n, 4)
-        mask=masks, # (n, h, w)
-        class_id=np.array(object_ids, dtype=np.int32),
+    results = processor.post_process_grounded_object_detection(
+        outputs,
+        inputs.input_ids,
+        threshold=0.25,
+        text_threshold=0.3,
+        target_sizes=[image.size[::-1]],
     )
-    box_annotator = sv.BoxAnnotator()
-    annotated_frame = box_annotator.annotate(scene=img.copy(), detections=detections)
-    label_annotator = sv.LabelAnnotator()
-    annotated_frame = label_annotator.annotate(annotated_frame, detections=detections, labels=[ID_TO_OBJECTS[i] for i in object_ids])
-    mask_annotator = sv.MaskAnnotator()
-    annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
-    cv2.imwrite(os.path.join(save_dir, f"annotated_frame_{frame_idx:05d}.jpg"), annotated_frame)
+
+    image_predictor.set_image(np.array(image))
+
+    input_boxes = results[0]["boxes"].cpu().numpy()
+    OBJECTS = results[0]["labels"]
+
+    masks, scores, logits = image_predictor.predict(
+        point_coords=None,
+        point_labels=None,
+        box=input_boxes,
+        multimask_output=False,
+    )
+
+    if masks.ndim == 3:
+        masks = masks[None]
+        scores = scores[None]
+        logits = logits[None]
+    elif masks.ndim == 4:
+        masks = masks.squeeze(1)
+
+    PROMPT_TYPE_FOR_VIDEO = "box"
+
+    assert PROMPT_TYPE_FOR_VIDEO in ["point", "box", "mask"], "SAM 2 video predictor only support point/box/mask prompt"
+
+    if PROMPT_TYPE_FOR_VIDEO == "point":
+        all_sample_points = sample_points_from_masks(masks=masks, num_points=10)
+
+        for object_id, (label, points) in enumerate(zip(OBJECTS, all_sample_points), start=1):
+            labels = np.ones((points.shape[0]), dtype=np.int32)
+            _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=ann_frame_idx,
+                obj_id=object_id,
+                points=points,
+                labels=labels,
+            )
+    elif PROMPT_TYPE_FOR_VIDEO == "box":
+        for object_id, (label, box) in enumerate(zip(OBJECTS, input_boxes), start=1):
+            _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=ann_frame_idx,
+                obj_id=object_id,
+                box=box,
+            )
+    elif PROMPT_TYPE_FOR_VIDEO == "mask":
+        for object_id, (label, mask) in enumerate(zip(OBJECTS, masks), start=1):
+            labels = np.ones((1), dtype=np.int32)
+            _, out_obj_ids, out_mask_logits = video_predictor.add_new_mask(
+                inference_state=inference_state,
+                frame_idx=ann_frame_idx,
+                obj_id=object_id,
+                mask=mask,
+            )
+    else:
+        raise NotImplementedError("SAM 2 video predictor only support point/box/mask prompts")
+
+    video_segments = {}
+    for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state):
+        video_segments[out_frame_idx] = {
+            out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+            for i, out_obj_id in enumerate(out_obj_ids)
+        }
+
+    save_dir = args.output_dir
+    os.makedirs(save_dir, exist_ok=True)
+
+    ID_TO_OBJECTS = {i: obj for i, obj in enumerate(OBJECTS, start=1)}
+    for frame_idx, segments in video_segments.items():
+        img = video_frames.get_bgr(frame_idx)
+
+        object_ids = list(segments.keys())
+        masks = list(segments.values())
+        masks = np.concatenate(masks, axis=0)
+
+        detections = sv.Detections(
+            xyxy=sv.mask_to_xyxy(masks),
+            mask=masks,
+            class_id=np.array(object_ids, dtype=np.int32),
+        )
+        box_annotator = sv.BoxAnnotator()
+        annotated_frame = box_annotator.annotate(scene=img.copy(), detections=detections)
+        label_annotator = sv.LabelAnnotator()
+        annotated_frame = label_annotator.annotate(
+            annotated_frame, detections=detections, labels=[ID_TO_OBJECTS[i] for i in object_ids]
+        )
+        mask_annotator = sv.MaskAnnotator()
+        annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
+        cv2.imwrite(os.path.join(save_dir, f"annotated_frame_{frame_idx:05d}.jpg"), annotated_frame)
+
+    if args.output_video:
+        output_video_path = args.output_video
+    else:
+        video_stem = os.path.splitext(os.path.basename(video_source.rstrip(os.sep)))[0]
+        if not video_stem:
+            video_stem = "tracking_output"
+        output_video_path = os.path.join(".", f"grounded_sam2_tracking_{video_stem}.mp4")
+
+    create_video_from_images(save_dir, output_video_path)
 
 
-"""
-Step 6: Convert the annotated frames to video
-"""
-
-video_stem = os.path.splitext(os.path.basename(VIDEO_SOURCE.rstrip(os.sep)))[0]
-if not video_stem:
-    video_stem = "tracking_output"
-output_video_path = os.path.join(".", f"grounded_sam2_tracking_{video_stem}.mp4")
-create_video_from_images(save_dir, output_video_path)
+if __name__ == "__main__":
+    main(parse_args())
