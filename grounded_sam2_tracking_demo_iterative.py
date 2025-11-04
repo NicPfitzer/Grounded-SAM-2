@@ -376,11 +376,11 @@ def main(args: argparse.Namespace) -> None:
     }[args.dino_model]
     processor = AutoProcessor.from_pretrained(dino_id)
     dino_kwargs = {}
-    if args.fp16 and device in {"cuda", "mps"}:
-        dino_kwargs["dtype"] = torch.float16
     grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(
-        dino_id, **dino_kwargs
+        dino_id
     ).to(device)
+    if args.fp16 and device in {"cuda", "mps"}:
+        grounding_model = grounding_model.half()
 
     inference_state = video_predictor.init_state(
         video_path=video_frames.source,
@@ -420,6 +420,11 @@ def main(args: argparse.Namespace) -> None:
                     inputs[key] = tensor
                 else:
                     inputs[key] = value
+            if args.fp16 and device in {"cuda", "mps"}:
+                print(f"[FP16 Debug] Grounding DINO dtype: {next(grounding_model.parameters()).dtype}")
+                for key, value in inputs.items():
+                    if isinstance(value, torch.Tensor):
+                        print(f"[FP16 Debug] inputs[{key}] dtype={value.dtype}, device={value.device}")
             with torch.no_grad():
                 outputs = grounding_model(**inputs)
 
