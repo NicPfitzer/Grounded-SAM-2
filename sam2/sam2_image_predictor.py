@@ -122,7 +122,7 @@ class SAM2ImagePredictor:
             vision_feats[-1] = vision_feats[-1] + self.model.no_mem_embed
 
         feats = [
-            feat.permute(1, 2, 0).view(1, -1, *feat_size)
+            feat.permute(1, 2, 0).view(1, -1, *feat_size).to(dtype=model_dtype)
             for feat, feat_size in zip(vision_feats[::-1], self._bb_feat_sizes[::-1])
         ][::-1]
         self._features = {"image_embed": feats[-1], "high_res_feats": feats[:-1]}
@@ -166,7 +166,7 @@ class SAM2ImagePredictor:
             vision_feats[-1] = vision_feats[-1] + self.model.no_mem_embed
 
         feats = [
-            feat.permute(1, 2, 0).view(batch_size, -1, *feat_size)
+            feat.permute(1, 2, 0).view(batch_size, -1, *feat_size).to(dtype=model_dtype)
             for feat, feat_size in zip(vision_feats[::-1], self._bb_feat_sizes[::-1])
         ][::-1]
         self._features = {"image_embed": feats[-1], "high_res_feats": feats[:-1]}
@@ -411,6 +411,9 @@ class SAM2ImagePredictor:
             boxes=None,
             masks=mask_input,
         )
+        prompt_dtype = next(self.model.sam_prompt_encoder.parameters()).dtype
+        sparse_embeddings = sparse_embeddings.to(dtype=prompt_dtype)
+        dense_embeddings = dense_embeddings.to(dtype=prompt_dtype)
 
         # Predict masks
         batched_mode = (

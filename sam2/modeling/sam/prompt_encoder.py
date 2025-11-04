@@ -74,7 +74,9 @@ class PromptEncoder(nn.Module):
           torch.Tensor: Positional encoding with shape
             1x(embed_dim)x(embedding_h)x(embedding_w)
         """
-        return self.pe_layer(self.image_embedding_size).unsqueeze(0)
+        pe = self.pe_layer(self.image_embedding_size).unsqueeze(0)
+        target_weight = self.point_embeddings[0].weight
+        return pe.to(device=target_weight.device, dtype=target_weight.dtype)
 
     def _embed_points(
         self,
