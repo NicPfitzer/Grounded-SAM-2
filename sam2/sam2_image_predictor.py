@@ -108,7 +108,8 @@ class SAM2ImagePredictor:
             raise NotImplementedError("Image format not supported")
 
         input_image = self._transforms(image)
-        input_image = input_image[None, ...].to(self.device)
+        model_dtype = next(self.model.parameters()).dtype
+        input_image = input_image[None, ...].to(device=self.device, dtype=model_dtype)
 
         assert (
             len(input_image.shape) == 4 and input_image.shape[1] == 3
@@ -151,7 +152,8 @@ class SAM2ImagePredictor:
             self._orig_hw.append(image.shape[:2])
         # Transform the image to the form expected by the model
         img_batch = self._transforms.forward_batch(image_list)
-        img_batch = img_batch.to(self.device)
+        model_dtype = next(self.model.parameters()).dtype
+        img_batch = img_batch.to(device=self.device, dtype=model_dtype)
         batch_size = img_batch.shape[0]
         assert (
             len(img_batch.shape) == 4 and img_batch.shape[1] == 3
