@@ -309,12 +309,13 @@ class SAM2ImagePredictor:
     ):
 
         unnorm_coords, labels, unnorm_box, mask_input = None, None, None, None
+        model_dtype = next(self.model.parameters()).dtype
         if point_coords is not None:
             assert (
                 point_labels is not None
             ), "point_labels must be supplied if point_coords is supplied."
             point_coords = torch.as_tensor(
-                point_coords, dtype=torch.float, device=self.device
+                point_coords, dtype=model_dtype, device=self.device
             )
             unnorm_coords = self._transforms.transform_coords(
                 point_coords, normalize=normalize_coords, orig_hw=self._orig_hw[img_idx]
@@ -323,13 +324,13 @@ class SAM2ImagePredictor:
             if len(unnorm_coords.shape) == 2:
                 unnorm_coords, labels = unnorm_coords[None, ...], labels[None, ...]
         if box is not None:
-            box = torch.as_tensor(box, dtype=torch.float, device=self.device)
+            box = torch.as_tensor(box, dtype=model_dtype, device=self.device)
             unnorm_box = self._transforms.transform_boxes(
                 box, normalize=normalize_coords, orig_hw=self._orig_hw[img_idx]
             )  # Bx2x2
         if mask_logits is not None:
             mask_input = torch.as_tensor(
-                mask_logits, dtype=torch.float, device=self.device
+                mask_logits, dtype=model_dtype, device=self.device
             )
             if len(mask_input.shape) == 3:
                 mask_input = mask_input[None, :, :, :]
