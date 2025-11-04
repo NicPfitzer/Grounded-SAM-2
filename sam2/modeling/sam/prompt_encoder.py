@@ -83,10 +83,14 @@ class PromptEncoder(nn.Module):
         pad: bool,
     ) -> torch.Tensor:
         """Embeds point prompts."""
-        points = points + 0.5  # Shift to center of pixel
+        points = points + points.new_tensor(0.5)  # Shift to center of pixel
         if pad:
-            padding_point = torch.zeros((points.shape[0], 1, 2), device=points.device)
-            padding_label = -torch.ones((labels.shape[0], 1), device=labels.device)
+            padding_point = torch.zeros(
+                (points.shape[0], 1, 2), device=points.device, dtype=points.dtype
+            )
+            padding_label = -torch.ones(
+                (labels.shape[0], 1), device=labels.device, dtype=labels.dtype
+            )
             points = torch.cat([points, padding_point], dim=1)
             labels = torch.cat([labels, padding_label], dim=1)
         point_embedding = self.pe_layer.forward_with_coords(
@@ -102,7 +106,7 @@ class PromptEncoder(nn.Module):
 
     def _embed_boxes(self, boxes: torch.Tensor) -> torch.Tensor:
         """Embeds box prompts."""
-        boxes = boxes + 0.5  # Shift to center of pixel
+        boxes = boxes + boxes.new_tensor(0.5)  # Shift to center of pixel
         coords = boxes.reshape(-1, 2, 2)
         corner_embedding = self.pe_layer.forward_with_coords(
             coords, self.input_image_size
@@ -162,7 +166,9 @@ class PromptEncoder(nn.Module):
         """
         bs = self._get_batch_size(points, boxes, masks)
         sparse_embeddings = torch.empty(
-            (bs, 0, self.embed_dim), device=self._get_device()
+            (bs, 0, self.embed_dim),
+            device=self._get_device(),
+            dtype=self.point_embeddings[0].weight.dtype,
         )
         if points is not None:
             coords, labels = points

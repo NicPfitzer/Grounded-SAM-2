@@ -129,9 +129,11 @@ class PositionEmbeddingRandom(nn.Module):
     def _pe_encoding(self, coords: torch.Tensor) -> torch.Tensor:
         """Positionally encode points that are normalized to [0,1]."""
         # assuming coords are in [0, 1]^2 square and have d_1 x ... x d_n x 2 shape
+        matrix_dtype = self.positional_encoding_gaussian_matrix.dtype
+        coords = coords.to(dtype=matrix_dtype)
         coords = 2 * coords - 1
         coords = coords @ self.positional_encoding_gaussian_matrix
-        coords = 2 * np.pi * coords
+        coords = coords * coords.new_tensor(2 * math.pi)
         # outputs d_1 x ... x d_n x C shape
         return torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1)
 
@@ -139,7 +141,8 @@ class PositionEmbeddingRandom(nn.Module):
         """Generate positional encoding for a grid of the specified size."""
         h, w = size
         device: Any = self.positional_encoding_gaussian_matrix.device
-        grid = torch.ones((h, w), device=device, dtype=torch.float32)
+        dtype = self.positional_encoding_gaussian_matrix.dtype
+        grid = torch.ones((h, w), device=device, dtype=dtype)
         y_embed = grid.cumsum(dim=0) - 0.5
         x_embed = grid.cumsum(dim=1) - 0.5
         y_embed = y_embed / h
@@ -152,10 +155,11 @@ class PositionEmbeddingRandom(nn.Module):
         self, coords_input: torch.Tensor, image_size: Tuple[int, int]
     ) -> torch.Tensor:
         """Positionally encode points that are not normalized to [0,1]."""
-        coords = coords_input.clone()
+        dtype = self.positional_encoding_gaussian_matrix.dtype
+        coords = coords_input.clone().to(dtype=dtype)
         coords[:, :, 0] = coords[:, :, 0] / image_size[1]
         coords[:, :, 1] = coords[:, :, 1] / image_size[0]
-        return self._pe_encoding(coords.to(torch.float))  # B x N x C
+        return self._pe_encoding(coords)  # B x N x C
 
 
 # Rotary Positional Encoding, adapted from:
